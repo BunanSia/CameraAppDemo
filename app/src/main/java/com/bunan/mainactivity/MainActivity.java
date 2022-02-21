@@ -3,6 +3,7 @@ package com.bunan.mainactivity;
 import android.Manifest;
 import android.app.Activity;
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.ImageFormat;
 import android.graphics.SurfaceTexture;
@@ -17,6 +18,7 @@ import android.hardware.camera2.TotalCaptureResult;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.Image;
 import android.media.ImageReader;
+import android.media.MediaRecorder;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
@@ -37,6 +39,7 @@ import android.widget.Button;
 import android.widget.Toast;
 import android.graphics.Matrix;
 import android.graphics.RectF;
+import android.net.Uri;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
@@ -45,7 +48,9 @@ import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Collections;
 
 //You have to extends AppCompatActivity otherwise java won't recognize onCreate since it doesn't have it in 'Object'
 public class MainActivity extends AppCompatActivity{
@@ -73,6 +78,7 @@ public class MainActivity extends AppCompatActivity{
     private File file;
     private static final int REQUEST_CAMERA_PERMISSION = 200;
     private boolean mFlashSupported;
+    private String mImageFileName;
 //Thread handling
     private Handler mBackgroundHandler;
     private HandlerThread mBackgroundThread;
@@ -99,6 +105,8 @@ public class MainActivity extends AppCompatActivity{
         @Override
         public void onSurfaceTextureAvailable(SurfaceTexture surface, int width, int height) {
             //open your camera here
+            setupCamera(width,height);
+            transformImage(width, height);
             openCamera();
         }
 
@@ -165,7 +173,7 @@ public class MainActivity extends AppCompatActivity{
 
     protected void takePicture() {
         if (null == cameraDevice) {
-            Log.e(TAG, "沒有相機");
+            Log.e(TAG, "cameraDevice is null");
             return;
         }
         CameraManager manager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
@@ -252,7 +260,49 @@ public class MainActivity extends AppCompatActivity{
             e.printStackTrace();
         }
     }
+    private final ImageReader.OnImageAvailableListener onImageAvailableListener = new
+            ImageReader.OnImageAvailableListener() {
+                @Override
+                public void onImageAvailable(ImageReader reader) {
+                    mBackgroundHandler.post(new ImageSaver(reader.acquireLatestImage()));
+                }
+            };
+    private class ImageSaver implements Runnable {
 
+        private final Image mImage;
+
+        public ImageSaver(Image image) {
+            mImage = image;
+        }
+
+        @Override
+        public void run() {
+            ByteBuffer byteBuffer = mImage.getPlanes()[0].getBuffer();
+            byte[] bytes = new byte[byteBuffer.remaining()];
+            byteBuffer.get(bytes);
+
+            FileOutputStream fileOutputStream = null;
+            try {
+                fileOutputStream = new FileOutputStream(mImageFileName);
+                fileOutputStream.write(bytes);
+            } catch (IOException e) {
+                e.printStackTrace();
+            } finally {
+                mImage.close();
+
+                Intent mediaStoreUpdateIntent = new Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE);
+
+                if(fileOutputStream != null) {
+                    try {
+                        fileOutputStream.close();
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
+                }
+            }
+
+        }
+    }
     protected void createCameraPreview() {
         try {
             SurfaceTexture texture = textureView.getSurfaceTexture();
@@ -289,7 +339,6 @@ public class MainActivity extends AppCompatActivity{
         try {
             cameraId = manager.getCameraIdList()[0];
             CameraCharacteristics characteristics = manager.getCameraCharacteristics(cameraId);
-            transformImage(640,480);
             StreamConfigurationMap map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
             assert map != null;
 
@@ -299,18 +348,76 @@ public class MainActivity extends AppCompatActivity{
                 ActivityCompat.requestPermissions(MainActivity.this, new String[]{Manifest.permission.CAMERA, Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQUEST_CAMERA_PERMISSION);
                 return;
             }
-
             manager.openCamera(cameraId, stateCallback, null);
         } catch (CameraAccessException e) {
             e.printStackTrace();
         }
         Log.e(TAG, "openCamera X");
     }
+    private static int sensorToDeviceOrientation(CameraCharacteristics cameraCharacteristics,int deviceOrientation){
+        int sensorOrientation=cameraCharacteristics.get(CameraCharacteristics.SENSOR_ORIENTATION);
+        deviceOrientation=ORIENTATIONS.get(deviceOrientation);
+        return (sensorOrientation+deviceOrientation+360)%360;
+    }
+
+    private void setupCamera(int width, int height) {
+        CameraManager cameraManager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
+        try {
+            for(String cameraId : cameraManager.getCameraIdList()){
+                CameraCharacteristics cameraCharacteristics = cameraManager.getCameraCharacteristics(cameraId);
+                if(cameraCharacteristics.get(CameraCharacteristics.LENS_FACING) ==
+                        CameraCharacteristics.LENS_FACING_FRONT){
+                    continue;
+                }
+                StreamConfigurationMap map = cameraCharacteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+                int deviceOrientation = getWindowManager().getDefaultDisplay().getRotation();
+                int rotation = sensorToDeviceOrientation(cameraCharacteristics, deviceOrientation);
+                boolean swapRotation = rotation == 90 || rotation == 270;
+                int rotatedWidth = width;
+                int rotatedHeight = height;
+                if(swapRotation) {
+                    rotatedWidth = height;
+                    rotatedHeight = width;
+                }
+                imageDimension = chooseOptimalSize(map.getOutputSizes(SurfaceTexture.class), rotatedWidth, rotatedHeight);
+//                mVideoSize = chooseOptimalSize(map.getOutputSizes(MediaRecorder.class), rotatedWidth, rotatedHeight);
+                imageDimension = chooseOptimalSize(map.getOutputSizes(ImageFormat.JPEG), rotatedWidth, rotatedHeight);
+                imageReader = ImageReader.newInstance(imageReader.getWidth(), imageReader.getHeight(), ImageFormat.JPEG, 1);
+                imageReader.setOnImageAvailableListener(onImageAvailableListener, mBackgroundHandler);
+                cameraId= cameraManager.getCameraIdList()[0];;
+                return;
+            }
+        } catch (CameraAccessException e) {
+            e.printStackTrace();
+        }
+    }
+    private static Size chooseOptimalSize(Size[] choices, int width, int height) {
+        List<Size> bigEnough = new ArrayList<Size>();
+        for(Size option : choices) {
+            if(option.getHeight() == option.getWidth() * height / width &&
+                    option.getWidth() >= width && option.getHeight() >= height) {
+                bigEnough.add(option);
+            }
+        }
+        if(bigEnough.size() > 0) {
+            return Collections.min(bigEnough, new CompareSizeByArea());
+        } else {
+            return choices[0];
+        }
+    }
+
+    private static class CompareSizeByArea implements Comparator<Size> {
+
+        @Override
+        public int compare(Size lhs, Size rhs) {
+            return Long.signum( (long)(lhs.getWidth() * lhs.getHeight()) -
+                    (long)(rhs.getWidth() * rhs.getHeight()));
+        }
+    }
+
     private void transformImage(int width, int height)
     {
-
         if (textureView == null) {
-
             return;
         } else try {
             {
@@ -375,7 +482,8 @@ public class MainActivity extends AppCompatActivity{
         Log.e(TAG, "onResume");
         startBackgroundThread();
         if (textureView.isAvailable()) {
-            transformImage(640,480);
+            setupCamera(textureView.getWidth(),textureView.getHeight());
+            transformImage(textureView.getWidth(),textureView.getHeight());
             openCamera();
         } else {
             textureView.setSurfaceTextureListener(textureListener);
